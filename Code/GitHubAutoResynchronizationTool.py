@@ -1,4 +1,5 @@
 import os
+import shutil
 import tkinter as tk
 from tkinter import ttk
 from tkinter import filedialog
@@ -109,7 +110,13 @@ class GitHubDownloader:
         else:
             data = self.get_github_contents(file_path)
             # Construct the raw GitHub URL for the file
-            download_url = data['download_url']
+            if 'download_url' in data:
+                download_url = data['download_url']
+            else:
+                self.failed_download.append(
+                    f"Failed to download the file {file_path}. The GitHub personal access token is either invalid or "
+                    f"has expired.")
+                return
             # Set up the headers with the authorization token
             # headers = {"Authorization": f"token {self.token}"}
 
@@ -168,6 +175,11 @@ class GitHubDownloader:
     def repo_traversal(self, path, folder):
         data = self.get_github_contents(path)
         for item in data:
+            if 'type' not in item:
+                self.failed_download.append(
+                    f"Failed to download the folder {path}. The GitHub personal access token is either invalid or has "
+                    f"expired.")
+                return
             # base case
             if item['type'] == 'file':
                 # print(item['name'])
@@ -287,7 +299,8 @@ class GitHubGUI:
                 # link_entry.insert(0, data['GitHub Link'])
                 # output_path_entry.insert(0, data['Output Path'])
 
-                ttk.Button(self.root, text="Browse", command=lambda i=output_path_entry: self.browse_output_path(i)).grid(
+                ttk.Button(self.root, text="Browse",
+                           command=lambda i=output_path_entry: self.browse_output_path(i)).grid(
                     row=row_number, column=2, padx=5, pady=5, sticky="w")
                 # Remove the existing "GitHub Token" label and entry
                 github_token_label_row = row_number + 1
@@ -326,9 +339,10 @@ class GitHubGUI:
                 self.token_entry = github_token_entry
 
                 # Move the buttons to the next row
-                ttk.Button(self.root, text="+ Add Row", command=self.add_row, style="G.TButton").grid(row=row_number + 1,
-                                                                                                      column=0, pady=10,
-                                                                                                      columnspan=2)
+                ttk.Button(self.root, text="+ Add Row", command=self.add_row, style="G.TButton").grid(
+                    row=row_number + 1,
+                    column=0, pady=10,
+                    columnspan=2)
                 ttk.Button(self.root, text="Download", command=self.download_file, style="C.TButton").grid(
                     row=row_number + 3,
                     column=0,
@@ -353,8 +367,12 @@ class GitHubGUI:
         self.repo_entry = parts[4]
         # self.token_entry.delete(0, tk.END)  # Assuming you don't want to populate the token from the link
         url = f"https://{parts[2]}/{parts[3]}/{parts[4]}"
-        all_tags = self.list_all_tags_for_remote_git_repo(url)
-        all_branches = self.list_all_branches_for_remote_git_repo(url)
+        if shutil.which("git"):  # checking if git is installed in system or not
+            all_tags = self.list_all_tags_for_remote_git_repo(url)
+            all_branches = self.list_all_branches_for_remote_git_repo(url)
+        else:
+            all_tags = self.get_github_tags(parts[2], parts[3], parts[4], self.token_entry.get(), 'tags')
+            all_branches = self.get_github_tags(parts[2], parts[3], parts[4], self.token_entry.get(), 'branches')
         all_tags += all_branches
         # If user enters GitHub repository page then we will assume that user wants to download main/master branch
         if len(parts) == 5:
@@ -538,6 +556,55 @@ class GitHubGUI:
 
         return branches
 
+    def Check_for_pagination_link(self, url, branches, headers=None):
+        while url:
+            if headers:
+                response = requests.get(url, headers=headers)
+            else:
+                response = requests.get(url)
+            if response.status_code == 200:
+                response.raise_for_status()
+                # print(response.json())
+                branches.extend(response.json())
+                # Check for pagination link
+                url = None
+                link_header = response.headers.get('Link')
+                if link_header:
+                    next_link = next((link.split(';')[0] for link in link_header.split(',') if 'rel="next"' in link),
+                                     None)
+                    if next_link:
+                        next_link = next_link.strip()
+                        url = next_link.strip('<>')
+
+            else:
+                return branches
+
+        return branches
+
+    def get_github_tags(self, hostname, owner, repo, token, tags_branches):
+        url = f"https://{hostname}/api/v3/repos/{owner}/{repo}/{tags_branches}"
+        headers = {"Authorization": f"token {token}"}
+        # response = requests.get(url, headers=headers)
+        tags = []
+        branches = self.Check_for_pagination_link(url, [], headers)
+
+        if not branches:
+            try:
+                url_public_repo = f"https://api.{hostname}/repos/{owner}/{repo}/{tags_branches}"
+                # headers = {"Authorization": f"token {token}"}
+                # response_public = requests.get(url_public_repo)
+                # response_public.raise_for_status()
+                branches = self.Check_for_pagination_link(url_public_repo, [])
+            except requests.exceptions.ConnectionError as e:
+                public_org_url = f"https://{hostname}/api/v3/repos/{owner}/{repo}/{tags_branches}"
+                branches = self.Check_for_pagination_link(public_org_url, [])
+        if branches:
+            for tag in branches:
+                tags.append(tag['name'])
+            tags.sort(key=len, reverse=True)
+
+        return tags
+
     def download_file(self):
         self.entries.insert(0, self.first_entry)
         row_number = 2
@@ -567,6 +634,7 @@ class GitHubGUI:
                         self.complete_button.configure(style="G.TButton")
                     else:
                         self.complete_button.configure(style="R.TButton")
+                        self.complete_button.configure(text="Failed")
 
                 else:
                     folder_name = self.file_path_entry.split('/')[-1]
@@ -584,12 +652,13 @@ class GitHubGUI:
                         self.complete_button.configure(style="G.TButton")
                     else:
                         self.complete_button.configure(style="R.TButton")
-                no_of_fail = self.download_failed + self.downloader.failed_download
+                        self.complete_button.configure(text="Failed")
+                self.download_failed += self.downloader.failed_download
             else:
-                no_of_fail = self.download_failed
                 self.complete_button = ttk.Button(self.root, text="Failed", state="active", style="R.TButton")
                 self.complete_button.grid(row=row_number, column=3, columnspan=2, pady=10)
                 self.complete_button["state"] = "normal"
+            no_of_fail = self.download_failed
             # Update the GUI
             self.root.update()
             # Simulate a delay
